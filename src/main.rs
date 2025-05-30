@@ -60,16 +60,28 @@ enum Commands {
         /// Secret key seed for deterministic peer ID
         #[arg(long, default_value = "0")]
         secret_key_seed: u8,
+        /// Chat room to join as relay
+        #[arg(short = 'c', long, default_value = "libp2p-chat")]
+        room: String,
     },
 }
 
 #[derive(NetworkBehaviour)]
-struct SimpleBehaviour {
+struct PeerBehaviour {
     identify: identify::Behaviour,
     kademlia: Kademlia<MemoryStore>,
     mdns: mdns::tokio::Behaviour,
     ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
+}
+
+#[derive(NetworkBehaviour)]
+struct RelayBehaviour {
+    identify: identify::Behaviour,
+    kademlia: Kademlia<MemoryStore>,
+    ping: ping::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+    relay: relay::Behaviour,
 }
 
 #[tokio::main]
@@ -91,7 +103,8 @@ async fn main() -> Result<()> {
             port,
             ipv6,
             secret_key_seed,
-        } => run_relay(port, ipv6, secret_key_seed).await,
+            room,
+        } => run_relay(port, ipv6, secret_key_seed, room).await,
     }
 }
 
@@ -117,7 +130,7 @@ async fn run_peer(
             yamux::Config::default,
         )?
         .with_behaviour(|keypair| {
-            // Create a simple behavior without relay client for now
+            // Create a peer behavior with relay client support
             let local_peer_id = PeerId::from(keypair.public());
             
             // Initialize basic behaviors
@@ -149,8 +162,8 @@ async fn run_peer(
             let store = MemoryStore::new(local_peer_id);
             let kademlia = Kademlia::with_config(local_peer_id, store, KademliaConfig::default());
 
-            // Create simple behavior struct
-            SimpleBehaviour {
+            // Create peer behavior struct
+            PeerBehaviour {
                 identify,
                 mdns,
                 ping,
@@ -221,7 +234,7 @@ async fn run_peer(
                         info!("Listening on: {}", address);
                     },
                     SwarmEvent::Behaviour(event) => {
-                        handle_behaviour_event(event, &room, &mut swarm).await;
+                        handle_peer_behaviour_event(event, &room, &mut swarm).await;
                     },
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         info!("Connected to peer: {} via {}", peer_id, endpoint.get_remote_address());
@@ -246,9 +259,9 @@ async fn run_peer(
     Ok(())
 }
 
-async fn handle_behaviour_event(event: SimpleBehaviourEvent, _room: &str, swarm: &mut libp2p::Swarm<SimpleBehaviour>) {
+async fn handle_peer_behaviour_event(event: PeerBehaviourEvent, _room: &str, swarm: &mut libp2p::Swarm<PeerBehaviour>) {
     match event {
-        SimpleBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+        PeerBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source: _,
             message_id: _,
             message,
@@ -256,7 +269,7 @@ async fn handle_behaviour_event(event: SimpleBehaviourEvent, _room: &str, swarm:
             let msg = String::from_utf8_lossy(&message.data);
             info!("Received: {}", msg);
         },
-        SimpleBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
+        PeerBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
             for (peer_id, multiaddr) in list {
                 info!("Discovered peer via mDNS: {} at {}", peer_id, multiaddr);
                 // Explicitly dial the peer to establish a stable connection
@@ -267,41 +280,41 @@ async fn handle_behaviour_event(event: SimpleBehaviourEvent, _room: &str, swarm:
                 }
             }
         },
-        SimpleBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
+        PeerBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
             for (peer_id, multiaddr) in list {
                 debug!("mDNS peer expired: {} at {}", peer_id, multiaddr);
             }
         },
-        SimpleBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+        PeerBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
             info!("Identified peer: {} with protocol version: {}", peer_id, info.protocol_version);
         },
-        SimpleBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. }) => {
+        PeerBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. }) => {
             debug!("Sent identify info to: {}", peer_id);
         },
-        SimpleBehaviourEvent::Kademlia(kad_event) => {
+        PeerBehaviourEvent::Kademlia(kad_event) => {
             debug!("Kademlia event: {:?}", kad_event);
         },
-        SimpleBehaviourEvent::Ping(ping::Event {
+        PeerBehaviourEvent::Ping(ping::Event {
             peer,
             result: Ok(rtt),
             ..
         }) => {
             debug!("Ping to {} succeeded with RTT: {:?}", peer, rtt);
         },
-        SimpleBehaviourEvent::Ping(ping::Event {
+        PeerBehaviourEvent::Ping(ping::Event {
             peer,
             result: Err(failure),
             ..
         }) => {
             warn!("Ping to {} failed: {:?}", peer, failure);
         },
-        SimpleBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
+        PeerBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
             info!("Peer {} subscribed to topic: {}", peer_id, topic);
         },
-        SimpleBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic }) => {
+        PeerBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic }) => {
             info!("Peer {} unsubscribed from topic: {}", peer_id, topic);
         },
-        SimpleBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id }) => {
+        PeerBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id }) => {
             warn!("Peer {} does not support gossipsub", peer_id);
         },
         _ => {
@@ -310,7 +323,7 @@ async fn handle_behaviour_event(event: SimpleBehaviourEvent, _room: &str, swarm:
     }
 }
 
-async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8) -> Result<()> {
+async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8, room: String) -> Result<()> {
     info!("Starting libp2p relay server on port {}...", port);
 
     // Generate deterministic key for consistent peer ID
@@ -322,7 +335,7 @@ async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8) -> Result<()>
     let local_peer_id = PeerId::from(local_key.public());
     info!("Relay peer ID: {}", local_peer_id);
 
-    // Build swarm for relay
+    // Build swarm for relay with full networking capabilities
     let mut swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
         .with_tcp(
@@ -330,8 +343,52 @@ async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8) -> Result<()>
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(|_| relay::Behaviour::new(local_peer_id, Default::default()))?
+        .with_behaviour(|keypair| {
+            let local_peer_id = PeerId::from(keypair.public());
+            
+            // Initialize identify behavior
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/libp2p-chat-relay/1.0".to_string(),
+                keypair.public(),
+            ));
+
+            // Initialize ping behavior
+            let ping = ping::Behaviour::new(ping::Config::new());
+
+            // Initialize gossipsub for chat (relay participates in network)
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(ValidationMode::Permissive)
+                .build()
+                .expect("Valid gossipsub config");
+            
+            let gossipsub = gossipsub::Behaviour::new(
+                MessageAuthenticity::Signed(keypair.clone()),
+                gossipsub_config,
+            ).expect("Correct configuration");
+
+            // Initialize Kademlia for DHT
+            let store = MemoryStore::new(local_peer_id);
+            let kademlia = Kademlia::with_config(local_peer_id, store, KademliaConfig::default());
+
+            // Initialize relay behavior
+            let relay = relay::Behaviour::new(local_peer_id, Default::default());
+
+            RelayBehaviour {
+                identify,
+                kademlia,
+                ping,
+                gossipsub,
+                relay,
+            }
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
+
+    // Subscribe to chat room so relay can help with message propagation
+    let topic = IdentTopic::new(room.clone());
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    info!("Relay subscribed to chat room: {}", room);
 
     // Listen on specified addresses
     let listen_addr_v4 = format!("/ip4/0.0.0.0/tcp/{}", port).parse::<Multiaddr>()?;
@@ -349,27 +406,15 @@ async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8) -> Result<()>
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Relay listening on: {}", address);
             },
-            SwarmEvent::Behaviour(relay::Event::ReservationReqAccepted {
-                src_peer_id,
-                renewed,
-            }) => {
-                info!(
-                    "Relay reservation {} for peer: {}",
-                    if renewed { "renewed" } else { "accepted" },
-                    src_peer_id
-                );
-            },
-            SwarmEvent::Behaviour(relay::Event::ReservationReqDenied { src_peer_id }) => {
-                warn!("Relay reservation denied for peer: {}", src_peer_id);
-            },
-            SwarmEvent::Behaviour(relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id }) => {
-                warn!("Circuit request denied from {} to {}", src_peer_id, dst_peer_id);
-            },
-            SwarmEvent::Behaviour(relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id }) => {
-                info!("Circuit established between {} and {}", src_peer_id, dst_peer_id);
+            SwarmEvent::Behaviour(event) => {
+                handle_relay_behaviour_event(event, &room).await;
             },
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 info!("Relay connected to peer: {} via {}", peer_id, endpoint.get_remote_address());
+                
+                // Add peer to Kademlia for DHT
+                let addr = endpoint.get_remote_address().clone().with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             },
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 info!("Relay disconnected from peer: {} (cause: {:?})", peer_id, cause);
@@ -383,6 +428,67 @@ async fn run_relay(port: u16, use_ipv6: bool, secret_key_seed: u8) -> Result<()>
             other => {
                 debug!("Other relay event: {:?}", other);
             }
+        }
+    }
+}
+
+async fn handle_relay_behaviour_event(event: RelayBehaviourEvent, _room: &str) {
+    match event {
+        RelayBehaviourEvent::Relay(relay::Event::ReservationReqAccepted {
+            src_peer_id,
+            renewed,
+        }) => {
+            info!(
+                "Relay reservation {} for peer: {}",
+                if renewed { "renewed" } else { "accepted" },
+                src_peer_id
+            );
+        },
+        RelayBehaviourEvent::Relay(relay::Event::ReservationReqDenied { src_peer_id }) => {
+            warn!("Relay reservation denied for peer: {}", src_peer_id);
+        },
+        RelayBehaviourEvent::Relay(relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id }) => {
+            warn!("Circuit request denied from {} to {}", src_peer_id, dst_peer_id);
+        },
+        RelayBehaviourEvent::Relay(relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id }) => {
+            info!("Circuit established between {} and {}", src_peer_id, dst_peer_id);
+        },
+        RelayBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source: _,
+            message_id: _,
+            message,
+        }) => {
+            let msg = String::from_utf8_lossy(&message.data);
+            info!("Relay received message: {}", msg);
+        },
+        RelayBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
+            info!("Peer {} subscribed to topic: {} (via relay)", peer_id, topic);
+        },
+        RelayBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic }) => {
+            info!("Peer {} unsubscribed from topic: {} (via relay)", peer_id, topic);
+        },
+        RelayBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
+            info!("Relay identified peer: {} with protocols: {:?}", peer_id, info.protocols);
+        },
+        RelayBehaviourEvent::Kademlia(kad_event) => {
+            debug!("Relay Kademlia event: {:?}", kad_event);
+        },
+        RelayBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Ok(rtt),
+            ..
+        }) => {
+            debug!("Relay ping to {} succeeded with RTT: {:?}", peer, rtt);
+        },
+        RelayBehaviourEvent::Ping(ping::Event {
+            peer,
+            result: Err(failure),
+            ..
+        }) => {
+            warn!("Relay ping to {} failed: {:?}", peer, failure);
+        },
+        _ => {
+            debug!("Other relay behaviour event: {:?}", event);
         }
     }
 } 
