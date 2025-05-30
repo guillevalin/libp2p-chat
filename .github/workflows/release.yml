@@ -96,14 +96,14 @@ jobs:
 
       - name: Upload artifact (Unix)
         if: matrix.platform.os != 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.platform.archive-name }}
           path: ${{ matrix.platform.archive-name }}.tar.gz
 
       - name: Upload artifact (Windows)
         if: matrix.platform.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.platform.archive-name }}
           path: ${{ matrix.platform.archive-name }}.zip
